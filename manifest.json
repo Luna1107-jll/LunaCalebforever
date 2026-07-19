@@ -1,7 +1,7 @@
 {
   "id": "/index.html",
-  "name": "私人聊天空间",
-  "short_name": "聊天空间",
+  "name": "lunacaleb专属",
+  "short_name": "Caleb",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
