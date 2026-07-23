@@ -941,7 +941,7 @@
                     
                     <div class="settings-card">
                         <div class="settings-card-title">📦 全量数据备份与恢复</div>
-                        <div class="settings-card-desc">包含你的聊天记录、所有字卡库、表情包、信件记录以及个人基础设置项。完整打包为一个 JSON 文件进行转移或备份。</div>
+                        <div class="settings-card-desc">包含你的聊天记录、所有字卡库、表情包、信件记录、经期记录、日程提醒以及个人基础设置项。完整打包为一个 JSON 文件进行转移或备份。</div>
                         <div class="settings-card-actions" style="flex-wrap:wrap;">
                             <button class="btn" id="btn-export-full-data">导出完整备份</button>
                             <label class="btn btn-accent" style="position:relative; overflow:hidden;">
@@ -1165,12 +1165,39 @@
             });
         }
 
+        // 把备份对象拆成很多小片段分别写进 Blob，而不是先拼成一整个巨大字符串再打包。
+        // 原因：JSON.stringify 在数据量很大时（表情包/聊天图片都是几十上百KB的base64文本），
+        // 生成的单个字符串会超过浏览器允许的最大字符串长度（约512MB），直接抛 "Invalid string length"。
+        // Blob 本身没有这个限制，只要我们不在中途拼出一个超大字符串就行。
+        function buildBackupBlobParts(dataObj) {
+            const parts = [];
+            const topKeys = Object.keys(dataObj);
+            parts.push('{\n');
+            topKeys.forEach((key, ki) => {
+                const val = dataObj[key];
+                const isLast = ki === topKeys.length - 1;
+                if (Array.isArray(val)) {
+                    parts.push(`"${key}": [\n`);
+                    val.forEach((item, i) => {
+                        parts.push(JSON.stringify(item)); // 每条记录单独序列化，体积很小，不会撞上限
+                        parts.push(i < val.length - 1 ? ',\n' : '\n');
+                    });
+                    parts.push(isLast ? ']\n' : '],\n');
+                } else {
+                    parts.push(`"${key}": ${JSON.stringify(val)}`);
+                    parts.push(isLast ? '\n' : ',\n');
+                }
+            });
+            parts.push('}');
+            return parts;
+        }
+
         function downloadJsonFile(dataObj, prefix) {
             const pad = n => String(n).padStart(2, '0');
             const d = new Date();
             const dateStr = `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}`;
             
-            const blob = new Blob([JSON.stringify(dataObj, null, 2)], { type: "application/json;charset=utf-8" });
+            const blob = new Blob(buildBackupBlobParts(dataObj), { type: "application/json;charset=utf-8" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
@@ -1221,6 +1248,10 @@
 
         let chatObserver = null;
         let lastRenderedDateKey = null;
+        let firstRenderedDateKey = null;
+        // 聊天记录分页状态：只保留最新一批消息渲染进DOM，避免记录越多、
+        // 每次打开App/每次发消息都要在几千条历史消息组成的巨大DOM里重新计算布局，越用越卡
+        const ChatPageState = { oldestLoadedId: null, hasMore: false, isLoadingOlder: false, PAGE_SIZE: 60 };
 
         function dateKeyOf(dateObj) {
             return `${dateObj.getFullYear()}-${dateObj.getMonth()}-${dateObj.getDate()}`;
@@ -2303,10 +2334,38 @@
 
         // --- 对话流存取核心 ---
         async function loadChatHistory() {
+            lastRenderedDateKey = null;
+            firstRenderedDateKey = null;
+            ChatPageState.oldestLoadedId = null;
+            ChatPageState.hasMore = false;
+
+            // 倒序游标只取最新 PAGE_SIZE 条，而不是把全部历史消息都读出来渲染
             let list = [];
+            let hasMoreOlder = false;
             await dbAction("chat", "readonly", store => {
-                return new Promise(res => { store.openCursor().onsuccess = e => { const c = e.target.result; if(c) { list.push(c.value); c.continue(); } else res(); }; });
+                return new Promise(res => {
+                    let count = 0;
+                    store.openCursor(null, 'prev').onsuccess = e => {
+                        const cursor = e.target.result;
+                        if (cursor && count < ChatPageState.PAGE_SIZE) {
+                            list.push(cursor.value);
+                            count++;
+                            cursor.continue();
+                        } else if (cursor) {
+                            hasMoreOlder = true; // 游标还没到头，说明还有更早的消息没加载
+                            res();
+                        } else {
+                            res();
+                        }
+                    };
+                });
             });
+            list.reverse(); // 倒序取出来的，翻回时间正序再渲染
+
+            if (list.length > 0) ChatPageState.oldestLoadedId = list[0].id;
+            ChatPageState.hasMore = hasMoreOlder;
+            if (ChatPageState.hasMore) renderLoadOlderButton();
+
             list.forEach(m => appendChatMessageDOM(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId));
             
             refreshLastStatusTags();
@@ -2315,6 +2374,89 @@
             initChatScrollObserver();
             processMyReadOtherMessages();
             updateChatNavBadge();
+        }
+
+        function renderLoadOlderButton() {
+            const box = document.getElementById('chat-box');
+            if (document.getElementById('btn-load-older-msgs')) return;
+            const btn = document.createElement('div');
+            btn.id = 'btn-load-older-msgs';
+            btn.textContent = '⬆️ 点击加载更早的消息';
+            btn.style.cssText = 'text-align:center; padding:10px; color:var(--text-muted); font-size:0.75rem; cursor:pointer;';
+            btn.onclick = loadOlderChatMessages;
+            box.insertBefore(btn, box.firstChild);
+        }
+
+        async function loadOlderChatMessages() {
+            if (ChatPageState.isLoadingOlder || !ChatPageState.hasMore || ChatPageState.oldestLoadedId === null) return;
+            ChatPageState.isLoadingOlder = true;
+            const btnEl = document.getElementById('btn-load-older-msgs');
+            if (btnEl) btnEl.textContent = '⏳ 加载中...';
+
+            let list = [];
+            let hasMoreOlder = false;
+            await dbAction("chat", "readonly", store => {
+                return new Promise(res => {
+                    let count = 0;
+                    const range = IDBKeyRange.upperBound(ChatPageState.oldestLoadedId, true);
+                    store.openCursor(range, 'prev').onsuccess = e => {
+                        const cursor = e.target.result;
+                        if (cursor && count < ChatPageState.PAGE_SIZE) {
+                            list.push(cursor.value);
+                            count++;
+                            cursor.continue();
+                        } else if (cursor) {
+                            hasMoreOlder = true;
+                            res();
+                        } else {
+                            res();
+                        }
+                    };
+                });
+            });
+            list.reverse();
+
+            const box = document.getElementById('chat-box');
+            if (list.length > 0) {
+                const prevScrollHeight = box.scrollHeight;
+                const prevScrollTop = box.scrollTop;
+
+                const frag = document.createDocumentFragment();
+                let runningKey = null;
+                list.forEach(m => {
+                    const msgDateObj = m.sentTime ? new Date(m.sentTime) : new Date();
+                    const msgDateKey = dateKeyOf(msgDateObj);
+                    if (msgDateKey !== runningKey) {
+                        frag.appendChild(buildDateSeparatorNode(msgDateObj));
+                        runningKey = msgDateKey;
+                    }
+                    frag.appendChild(buildChatMessageElement(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId));
+                });
+
+                // 拼接处如果跟当前已显示的第一条是同一天，原来那条日期分隔线就多余了，删掉避免重复
+                const anchorBtn = document.getElementById('btn-load-older-msgs');
+                if (runningKey !== null && runningKey === firstRenderedDateKey) {
+                    const firstAfterBtn = anchorBtn ? anchorBtn.nextSibling : box.firstChild;
+                    if (firstAfterBtn && firstAfterBtn.classList && firstAfterBtn.classList.contains('chat-date-separator')) {
+                        firstAfterBtn.remove();
+                    }
+                }
+                firstRenderedDateKey = dateKeyOf(list[0].sentTime ? new Date(list[0].sentTime) : new Date());
+
+                box.insertBefore(frag, anchorBtn ? anchorBtn.nextSibling : box.firstChild);
+
+                ChatPageState.oldestLoadedId = list[0].id;
+                box.scrollTop = prevScrollTop + (box.scrollHeight - prevScrollHeight);
+            }
+
+            ChatPageState.hasMore = hasMoreOlder;
+            ChatPageState.isLoadingOlder = false;
+
+            const btnFinal = document.getElementById('btn-load-older-msgs');
+            if (btnFinal) {
+                if (ChatPageState.hasMore) { btnFinal.textContent = '⬆️ 点击加载更早的消息'; }
+                else { btnFinal.remove(); }
+            }
         }
 
         async function pushChatMessage(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, messageType = 'text', quoteInfo = null) {
@@ -2348,20 +2490,14 @@
             return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         }
 
-        function appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null) {
-            const box = document.getElementById('chat-box');
+        function buildDateSeparatorNode(dateObj) {
+            const sep = document.createElement('div');
+            sep.className = 'chat-date-separator';
+            sep.innerHTML = `<span>${formatDateSeparatorLabel(dateObj)}</span>`;
+            return sep;
+        }
 
-            // 日期分隔线：与上一条渲染的消息不在同一天时，先插入“今天/昨天/x月x日”标签
-            const msgDateObj = sentTime ? new Date(sentTime) : new Date();
-            const msgDateKey = dateKeyOf(msgDateObj);
-            if (msgDateKey !== lastRenderedDateKey) {
-                const sep = document.createElement('div');
-                sep.className = 'chat-date-separator';
-                sep.innerHTML = `<span>${formatDateSeparatorLabel(msgDateObj)}</span>`;
-                box.appendChild(sep);
-                lastRenderedDateKey = msgDateKey;
-            }
-
+        function buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null) {
             const div = document.createElement('div'); 
             div.className = `message ${isMe ? 'me' : 'other'}`;
             if(dbId) div.setAttribute('data-db-id', dbId);
@@ -2443,7 +2579,6 @@
                 `;
             }
             
-            box.appendChild(div);
             if(chatObserver && !isMe) { chatObserver.observe(div); }
             
             const btnReply = div.querySelector('.btn-reply-from-chat');
@@ -2460,6 +2595,24 @@
                     jumpToMessage(quoteBlockNode.dataset.quotedId);
                 });
             }
+
+            return div;
+        }
+
+        function appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null) {
+            const box = document.getElementById('chat-box');
+
+            // 日期分隔线：与上一条渲染的消息不在同一天时，先插入“今天/昨天/x月x日”标签
+            const msgDateObj = sentTime ? new Date(sentTime) : new Date();
+            const msgDateKey = dateKeyOf(msgDateObj);
+            if (msgDateKey !== lastRenderedDateKey) {
+                box.appendChild(buildDateSeparatorNode(msgDateObj));
+                lastRenderedDateKey = msgDateKey;
+            }
+            if (firstRenderedDateKey === null) firstRenderedDateKey = msgDateKey;
+
+            const div = buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat, letterId, isRead, dbId, messageType, sentTime, quotedSender, quotedText, quotedId);
+            box.appendChild(div);
         }
 
         function jumpToMessage(quotedId) {
@@ -4201,16 +4354,20 @@ nav {
                     config: localStorage.getItem('top_app_config'),
                     cards: await getAllFromStore('cards'),
                     letters: await getAllFromStore('letters'),
-                    chat: await getAllFromStore('chat')
+                    chat: await getAllFromStore('chat'),
+                    periods: await getAllFromStore('periods'),
+                    reminders: await getAllFromStore('reminders')
                 };
             }
             async function restoreFullBackupData(data) {
                 if(data.type !== 'fullBackup') throw new Error('这不是合法的全量备份格式！');
-                if(!confirm('【警告】全量恢复将永久删除并覆盖当前空间的所有聊天、字卡、信件及个人设置。是否确定继续？')) return;
-                await clearStore('cards'); await clearStore('letters'); await clearStore('chat');
+                if(!confirm('【警告】全量恢复将永久删除并覆盖当前空间的所有聊天、字卡、信件、经期记录、日程提醒及个人设置。是否确定继续？')) return;
+                await clearStore('cards'); await clearStore('letters'); await clearStore('chat'); await clearStore('periods'); await clearStore('reminders');
                 if(data.cards && data.cards.length > 0) await insertMultipleSafe('cards', data.cards);
                 if(data.letters && data.letters.length > 0) await insertMultipleSafe('letters', data.letters);
                 if(data.chat && data.chat.length > 0) await insertMultipleSafe('chat', data.chat);
+                if(data.periods && data.periods.length > 0) await insertMultipleSafe('periods', data.periods);
+                if(data.reminders && data.reminders.length > 0) await insertMultipleSafe('reminders', data.reminders);
                 if(data.config) localStorage.setItem('top_app_config', data.config);
                 alert('🎉 全量数据恢复成功！系统将重新加载。');
                 location.reload();
@@ -4229,7 +4386,13 @@ nav {
 
             // 文本方式导出弹窗：应对打包成独立App后 Blob 文件下载不可用的情况
             function showTextExportModal(dataObj, titleText) {
-                const jsonStr = JSON.stringify(dataObj, null, 2);
+                let jsonStr;
+                try {
+                    jsonStr = JSON.stringify(dataObj, null, 2);
+                } catch (e) {
+                    alert('数据量太大，没法用"文本导出"这种方式（文本框/剪贴板本身处理不了这么大的内容）。\n\n请改用普通的"导出完整备份"按钮，它会直接生成一个文件下载，不受这个限制。');
+                    return;
+                }
                 openModal(`
                     <div class="modal-title">${titleText}（文本方式）</div>
                     <div style="font-size:0.72rem; color:var(--text-muted); margin-bottom:8px; line-height:1.5;">
