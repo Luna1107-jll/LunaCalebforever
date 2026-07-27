@@ -971,6 +971,15 @@
                     </div>
 
                     <div class="settings-card">
+                        <div class="settings-card-title">📦 归档旧聊天记录</div>
+                        <div class="settings-card-desc">选一个日期，这个日期<b>之前</b>的聊天记录会先自动打包导出成文件，成功后再从App里删除，给App瘦身、加快打开速度。记录不会丢，只是搬去了导出的文件里；之后如果想找回来，可以用上面的"恢复聊天记录"或"粘贴恢复"重新导入。</div>
+                        <div class="settings-card-actions" style="flex-wrap:wrap; align-items:center;">
+                            <input type="date" id="input-archive-before-date" class="chat-input" style="border-radius:6px; width:auto;">
+                            <button class="btn btn-accent" id="btn-archive-old-chat">归档并清理</button>
+                        </div>
+                    </div>
+
+                    <div class="settings-card">
                         <div class="settings-card-title">⏱ 字卡回复等待时间设置</div>
                         <div class="settings-card-desc">自动回复触发时，将在下方区间内随机取值作为延迟时间（单位：秒）。</div>
                         <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
@@ -1190,6 +1199,44 @@
             });
             parts.push('}');
             return parts;
+        }
+
+        // 图片压缩：新上传的图片统一走这里处理一遍再存进数据库/localStorage。
+        // 手机相册原图动辄几MB，压完通常能降到原来的十分之一甚至更多，肉眼基本看不出差别。
+        // 只影响"以后新上传"的图片，已经存好的旧数据不会被这个函数处理。
+        function compressImageFile(file, maxDimension = 1280, quality = 0.8) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        let width = img.width, height = img.height;
+                        if (width > maxDimension || height > maxDimension) {
+                            if (width >= height) {
+                                height = Math.round(height * (maxDimension / width));
+                                width = maxDimension;
+                            } else {
+                                width = Math.round(width * (maxDimension / height));
+                                height = maxDimension;
+                            }
+                        }
+                        const canvas = document.createElement('canvas');
+                        canvas.width = width;
+                        canvas.height = height;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, width, height);
+                        // PNG/GIF 大概率是带透明背景的表情贴纸，转 JPEG 会把透明区域填成黑色底，
+                        // 所以这类图保留 PNG（靠缩小尺寸省空间），其余（基本是拍照上传的图）转 JPEG 有损压缩
+                        const keepPng = file.type === 'image/png' || file.type === 'image/gif';
+                        const dataUrl = keepPng ? canvas.toDataURL('image/png') : canvas.toDataURL('image/jpeg', quality);
+                        resolve(dataUrl);
+                    };
+                    img.onerror = () => reject(new Error('图片解析失败，换一张试试'));
+                    img.src = evt.target.result;
+                };
+                reader.onerror = () => reject(new Error('文件读取失败'));
+                reader.readAsDataURL(file);
+            });
         }
 
         function downloadJsonFile(dataObj, prefix) {
@@ -2024,16 +2071,13 @@
             if(!files || files.length === 0) return;
             
             const base64Files = await Promise.all(Array.from(files).map(file => {
-                return new Promise(resolve => {
-                    const reader = new FileReader();
-                    reader.onload = evt => resolve(evt.target.result);
-                    reader.readAsDataURL(file);
-                });
+                return compressImageFile(file, 640, 0.85).catch(() => null); // 表情包不需要太大尺寸，640够用
             }));
+            const validFiles = base64Files.filter(Boolean);
 
             let processed = 0;
             await dbAction("cards", "readwrite", store => {
-                return Promise.all(base64Files.map(b64 => {
+                return Promise.all(validFiles.map(b64 => {
                     return new Promise(res => {
                         const req = store.add({
                             text: b64,
@@ -2465,9 +2509,12 @@
             const quotedId = quoteInfo ? quoteInfo.id : null;
             const quotedSender = quoteInfo ? quoteInfo.sender : null;
             const quotedText = quoteInfo ? quoteInfo.text : null;
+            // 头像不再逐条存进每条消息记录里——头像图片本身可能几十上百KB，
+            // 存几千条消息等于把同一张头像复制几千遍，是存储爆炸的头号元凶。
+            // 现在只存文字/图片这些真正每条都不一样的内容，头像统一在渲染时实时从当前资料读取。
             await dbAction("chat", "readwrite", store => {
                 return new Promise(res => {
-                    const req = store.add({ sender, text, avatar, isMe, isLetterFormat, letterId, isRead, messageType, sentTime, quotedId, quotedSender, quotedText });
+                    const req = store.add({ sender, text, avatar: null, isMe, isLetterFormat, letterId, isRead, messageType, sentTime, quotedId, quotedSender, quotedText });
                     req.onsuccess = (e) => { insertedId = e.target.result; res(); };
                 });
             });
@@ -2567,14 +2614,19 @@
                 }
             }
 
+            // 头像统一用当前资料里的头像渲染（不再依赖每条消息各自存的头像）；
+            // 对于清理之前存量数据里还带着旧头像的老消息，live头像取不到时才退回用传入的值兜底
+            const liveAvatar = isMe ? AppState.myProfile.avatar : AppState.otherProfile.avatar;
+            const resolvedAvatar = liveAvatar || avatar || '';
+
             if (isMe) {
                 div.innerHTML = `
                     ${contentBodyHtml}
-                    <img src="${escapeHtml(avatar)}" class="avatar" alt="头像">
+                    <img src="${escapeHtml(resolvedAvatar)}" class="avatar" alt="头像">
                 `;
             } else {
                 div.innerHTML = `
-                    <img src="${escapeHtml(avatar)}" class="avatar" alt="头像">
+                    <img src="${escapeHtml(resolvedAvatar)}" class="avatar" alt="头像">
                     ${contentBodyHtml}
                 `;
             }
@@ -3313,12 +3365,13 @@ nav {
                 saveConfig();
             };
 
-            document.getElementById('input-chat-bg-image').onchange = function(e) {
+            document.getElementById('input-chat-bg-image').onchange = async function(e) {
                 const file = e.target.files[0];
                 if (!file) return;
-                const reader = new FileReader();
-                reader.onload = (evt) => {
-                    AppState.chatBackgroundImage = evt.target.result;
+                e.target.value = '';
+                try {
+                    const compressed = await compressImageFile(file, 1600, 0.8);
+                    AppState.chatBackgroundImage = compressed;
                     try {
                         localStorage.setItem('chat_bg_image', AppState.chatBackgroundImage);
                     } catch (err) {
@@ -3326,9 +3379,9 @@ nav {
                         return;
                     }
                     applyChatBackground();
-                };
-                reader.readAsDataURL(file);
-                e.target.value = '';
+                } catch (err) {
+                    alert('图片处理失败：' + err.message);
+                }
             };
 
             document.getElementById('btn-clear-chat-bg').onclick = () => {
@@ -3880,11 +3933,10 @@ nav {
             }
         }
 
-        function handleAvatarChange(fileInput, type) {
+        async function handleAvatarChange(fileInput, type) {
             const file = fileInput.files[0]; if(!file) return;
-            const reader = new FileReader();
-            reader.onload = e => {
-                const base64Data = e.target.result;
+            try {
+                const base64Data = await compressImageFile(file, 400, 0.85); // 头像展示尺寸很小，400足够清晰
                 if(type === 'me') { 
                     AppState.myProfile.avatar = base64Data; 
                     document.getElementById('avatar-my').src = base64Data; 
@@ -3896,8 +3948,9 @@ nav {
                     document.querySelectorAll('.message.other .avatar').forEach(img => img.src = base64Data);
                 }
                 saveConfig();
-            };
-            reader.readAsDataURL(file);
+            } catch (err) {
+                alert('头像处理失败：' + err.message);
+            }
         }
 
         function escapeHtml(str) {
@@ -4224,16 +4277,16 @@ nav {
             document.getElementById('upload-chat-photo-input').onchange = async function(e) {
                 const file = e.target.files[0];
                 if (!file) return;
-                const reader = new FileReader();
-                reader.onload = async (evt) => {
-                    const base64Data = evt.target.result;
+                e.target.value = '';
+                try {
+                    const base64Data = await compressImageFile(file, 1280, 0.8);
                     const quoteInfo = AppState.quotingMessage;
                     cancelQuoting();
                     const insertedId = await pushChatMessage(AppState.myProfile.name, base64Data, AppState.myProfile.avatar, true, false, null, 1, 'photo', quoteInfo);
                     await triggerSmartResponseFlow(insertedId);
-                };
-                reader.readAsDataURL(file);
-                e.target.value = '';
+                } catch (err) {
+                    alert('图片处理失败：' + err.message);
+                }
             };
 
             document.getElementById('plus-item-music').onclick = () => {
@@ -4447,17 +4500,34 @@ nav {
                 };
             }
 
-            document.getElementById('btn-export-full-data').onclick = async () => {
+            // 数据量大的时候导出要跑好几秒，之前点击没有任何反馈，容易让人误以为卡死了。
+            // 这里统一加一个"导出中..."的按钮态，处理完再恢复，且成功后明确弹一次提示。
+            async function runExportWithLoadingState(btn, exportFn) {
+                const originalText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 导出中...';
                 try {
+                    await exportFn();
+                } catch(e) {
+                    alert("导出失败：" + e.message);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
+            }
+
+            document.getElementById('btn-export-full-data').onclick = function() {
+                runExportWithLoadingState(this, async () => {
                     const fullData = await collectFullBackupData();
                     downloadJsonFile(fullData, '极简空间_全量备份');
-                } catch(e) { alert("导出失败：" + e.message); }
+                    alert('✅ 全量备份导出成功，请在下载/文件管理里查看。');
+                });
             };
-            document.getElementById('btn-export-full-data-text').onclick = async () => {
-                try {
+            document.getElementById('btn-export-full-data-text').onclick = function() {
+                runExportWithLoadingState(this, async () => {
                     const fullData = await collectFullBackupData();
                     showTextExportModal(fullData, '全量备份');
-                } catch(e) { alert("导出失败：" + e.message); }
+                });
             };
             document.getElementById('btn-import-full-data-text').onclick = () => {
                 showTextImportModal(async (data) => { await restoreFullBackupData(data); });
@@ -4476,17 +4546,18 @@ nav {
                 reader.readAsText(file);
             };
 
-            document.getElementById('btn-export-chat-data').onclick = async () => {
-                try {
+            document.getElementById('btn-export-chat-data').onclick = function() {
+                runExportWithLoadingState(this, async () => {
                     const chatData = await collectChatBackupData();
                     downloadJsonFile(chatData, '极简空间_聊天记录备份');
-                } catch(e) { alert("导出失败：" + e.message); }
+                    alert('✅ 聊天记录导出成功，请在下载/文件管理里查看。');
+                });
             };
-            document.getElementById('btn-export-chat-data-text').onclick = async () => {
-                try {
+            document.getElementById('btn-export-chat-data-text').onclick = function() {
+                runExportWithLoadingState(this, async () => {
                     const chatData = await collectChatBackupData();
                     showTextExportModal(chatData, '聊天记录备份');
-                } catch(e) { alert("导出失败：" + e.message); }
+                });
             };
             document.getElementById('btn-import-chat-data-text').onclick = () => {
                 showTextImportModal(async (data) => { await restoreChatBackupData(data); });
@@ -4529,6 +4600,51 @@ nav {
                     alert('💬 聊天记录已清空，页面即将重新加载。');
                     location.reload();
                 } catch(e) { alert('清空失败：' + e.message); }
+            };
+
+            document.getElementById('btn-archive-old-chat').onclick = async () => {
+                const dateStr = document.getElementById('input-archive-before-date').value;
+                if (!dateStr) { alert('请先选一个日期～'); return; }
+                // input[type=date]拿到的是本地日期，转成本地时间的0点再算UTC时间戳，跟数据库里存的sentTime对齐
+                const cutoffIso = new Date(dateStr + 'T00:00:00').toISOString();
+
+                const btn = document.getElementById('btn-archive-old-chat');
+                const originalText = btn.textContent;
+                btn.disabled = true;
+                btn.textContent = '⏳ 处理中...';
+                try {
+                    const allChat = await getAllFromStore('chat');
+                    const toArchive = allChat.filter(m => m.sentTime && m.sentTime < cutoffIso);
+                    if (toArchive.length === 0) {
+                        alert('没有找到这个日期之前的聊天记录，不需要归档。');
+                        return;
+                    }
+                    if (!confirm(`将归档 ${dateStr} 之前的 ${toArchive.length} 条消息：先导出成文件，确认下载成功后再从App里永久删除这部分记录（不影响这个日期之后的记录）。是否继续？`)) return;
+
+                    downloadJsonFile({ type: 'chatOnlyBackup', chat: toArchive }, `极简空间_聊天记录归档_${dateStr}之前`);
+
+                    if (!confirm('请先去手机的"下载/文件管理"里确认归档文件已经成功保存好！\n\n确认没问题了吗？点"确定"才会真正删除这部分聊天记录；点"取消"则不会删除任何内容。')) {
+                        alert('已取消，没有删除任何聊天记录。');
+                        return;
+                    }
+
+                    const idsToDelete = toArchive.map(m => m.id);
+                    await dbAction('chat', 'readwrite', store => {
+                        return Promise.all(idsToDelete.map(id => new Promise(res => {
+                            const req = store.delete(id);
+                            req.onsuccess = () => res();
+                            req.onerror = () => res();
+                        })));
+                    });
+
+                    alert(`✅ 归档完成，已清理 ${idsToDelete.length} 条旧消息。页面将重新加载。`);
+                    location.reload();
+                } catch (e) {
+                    alert('归档失败：' + e.message);
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                }
             };
 
             // --- 新增设置项：回复延迟 / 已读不回 / 主动发消息 ---
