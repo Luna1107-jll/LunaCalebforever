@@ -4,7 +4,7 @@
 // 注意：浏览器不允许在 file:// 本地直接打开的页面里注册 Service Worker，
 // 这是浏览器的安全限制，不是这个文件的问题。
 
-const CACHE_NAME = 'chat-app-shell-v1';
+const CACHE_NAME = 'chat-app-shell-v2';
 
 self.addEventListener('install', (event) => {
   // 立即激活，不用等旧版本关闭
@@ -16,9 +16,17 @@ self.addEventListener('activate', (event) => {
 });
 
 // 简单直连转发：部分浏览器把"是否存在 fetch 监听"作为可安装 PWA 的判断依据之一，
-// 这里不做离线缓存，只是原样放行请求。
+// 这里不做离线缓存。同源的页面/脚本请求每次都先向服务器确认是否有新版本，
+// 避免 GitHub Pages 的 10 分钟浏览器缓存让你更新后还看到旧页面。
 self.addEventListener('fetch', (event) => {
-  event.respondWith(fetch(event.request));
+  const req = event.request;
+  let sameOrigin = false;
+  try { sameOrigin = new URL(req.url).origin === self.location.origin; } catch (e) {}
+  if (req.method === 'GET' && sameOrigin) {
+    event.respondWith(fetch(req, { cache: 'no-cache' }).catch(() => fetch(req)));
+  } else {
+    event.respondWith(fetch(req));
+  }
 });
 
 // 点击系统通知时，尝试聚焦已打开的页面，如果没有打开的页面则新开一个
