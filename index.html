@@ -391,6 +391,10 @@
         .msg-action-toolbar button:active { background: var(--border-color); }
         .msg-action-toolbar button.danger { color: #e5989b; }
         .chat-input { flex: 1; min-width: 0; border: none; background: var(--bg-color); padding: 8px 14px; border-radius: 20px; font-family: inherit; font-size: 16px; outline: none; }
+        /* 聊天输入框用 contenteditable 代替 input，避免 Chrome 弹出密码/银行卡/地址自动填充栏 */
+        .chat-input.chat-editable { display: block; line-height: 20px; white-space: pre; overflow-x: auto; overflow-y: hidden; scrollbar-width: none; -webkit-user-select: text; user-select: text; cursor: text; -webkit-appearance: none; }
+        .chat-input.chat-editable::-webkit-scrollbar { display: none; }
+        .chat-input.chat-editable:empty::before { content: attr(data-placeholder); color: #9a9a9a; pointer-events: none; }
 
         /* 表情面板样式 */
         .emoji-panel-popover {
@@ -775,7 +779,7 @@
                         <svg class="svg-icon" style="width:16px; height:16px;" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
                     </button>
 
-                    <input type="text" class="chat-input" id="chat-input" placeholder="输入对话内容..." autocomplete="off">
+                    <div class="chat-input chat-editable" id="chat-input" contenteditable="plaintext-only" role="textbox" aria-label="输入对话内容" data-placeholder="输入对话内容..." enterkeyhint="send" autocapitalize="off" autocorrect="off" spellcheck="false" translate="no"></div>
                     
                     <button class="btn" id="btn-toggle-emoji-panel" style="border-radius: 50%; padding: 8px; flex-shrink:0;" title="选择我的表情包">
                         <svg class="svg-icon" style="width:16px; height:16px;" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2M9 9h.01M15 9h.01"/></svg>
@@ -4211,7 +4215,33 @@ nav {
                 await triggerSmartResponseFlow(insertedId);
             };
             document.getElementById('btn-send-chat').onclick = sendChatFunc;
-            document.getElementById('chat-input').onkeydown = (e) => { if(e.key === 'Enter') sendChatFunc(); };
+            (() => {
+                const ce = document.getElementById('chat-input');
+                // 兼容原来的 el.value 写法
+                Object.defineProperty(ce, 'value', {
+                    get() { return ce.textContent.replace(/\u200b/g, ''); },
+                    set(v) { ce.textContent = v || ''; }
+                });
+                // 不支持 plaintext-only 的浏览器退回 true
+                if (ce.contentEditable !== 'plaintext-only') ce.contentEditable = 'true';
+                // 清空后去掉残留的 <br>，保证占位提示能显示
+                ce.addEventListener('input', () => { if (!ce.textContent) ce.innerHTML = ''; });
+                // 粘贴只保留纯文本，并把换行压成空格
+                ce.addEventListener('paste', (e) => {
+                    e.preventDefault();
+                    const t = ((e.clipboardData || window.clipboardData).getData('text') || '').replace(/[\r\n]+/g, ' ');
+                    document.execCommand('insertText', false, t);
+                });
+                // 回车发送（输入法组词中的回车不算）
+                ce.addEventListener('keydown', (e) => {
+                    if (e.isComposing || e.keyCode === 229) return;
+                    if (e.key === 'Enter') { e.preventDefault(); sendChatFunc(); }
+                });
+                // 部分安卓键盘的“发送/开始”键走 beforeinput
+                ce.addEventListener('beforeinput', (e) => {
+                    if (e.inputType === 'insertParagraph' || e.inputType === 'insertLineBreak') { e.preventDefault(); sendChatFunc(); }
+                });
+            })();
             document.getElementById('quote-preview-close').onclick = cancelQuoting;
 
             document.getElementById('btn-add-card-modal').onclick = () => openCardModal();
