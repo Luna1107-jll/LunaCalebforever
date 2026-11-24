@@ -342,15 +342,21 @@
             padding: 4px 8px;
             border-radius: 4px;
             margin-bottom: 4px;
-            max-width: 200px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
+            max-width: 100%;
+            text-align: left;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-break: break-all;
             cursor: pointer;
             -webkit-user-select: none;
             user-select: none;
         }
         .msg-quote-block:active { opacity: 0.6; }
+        .msg-quote-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; margin-bottom: 2px; font-size: 0.66rem; line-height: 1.3; }
+        .msg-quote-sender { color: var(--accent-color); font-weight: bold; }
+        .msg-quote-time { margin-top: 3px; font-size: 0.64rem; line-height: 1.3; opacity: 0.8; }
+        .msg-quote-time:empty { display: none; }
+        .msg-quote-text { white-space: pre-wrap; word-break: break-all; }
 
         @keyframes msgHighlightFlash {
             0% { box-shadow: 0 0 0 4px rgba(229, 152, 155, 0.65); }
@@ -2414,7 +2420,7 @@
             ChatPageState.hasMore = hasMoreOlder;
             if (ChatPageState.hasMore) renderLoadOlderButton();
 
-            list.forEach(m => appendChatMessageDOM(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId));
+            list.forEach(m => appendChatMessageDOM(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId, m.quotedTime));
             
             refreshLastStatusTags();
             const b = document.getElementById('chat-box'); b.scrollTop = b.scrollHeight;
@@ -2478,7 +2484,7 @@
                         frag.appendChild(buildDateSeparatorNode(msgDateObj));
                         runningKey = msgDateKey;
                     }
-                    frag.appendChild(buildChatMessageElement(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId));
+                    frag.appendChild(buildChatMessageElement(m.sender, m.text, m.avatar, m.isMe, m.isLetterFormat, m.letterId, m.isRead, m.id, m.messageType || 'text', m.sentTime, m.quotedSender, m.quotedText, m.quotedId, m.quotedTime));
                 });
 
                 // 拼接处如果跟当前已显示的第一条是同一天，原来那条日期分隔线就多余了，删掉避免重复
@@ -2513,16 +2519,17 @@
             const quotedId = quoteInfo ? quoteInfo.id : null;
             const quotedSender = quoteInfo ? quoteInfo.sender : null;
             const quotedText = quoteInfo ? quoteInfo.text : null;
+            const quotedTime = quoteInfo ? (quoteInfo.time || null) : null;
             // 头像不再逐条存进每条消息记录里——头像图片本身可能几十上百KB，
             // 存几千条消息等于把同一张头像复制几千遍，是存储爆炸的头号元凶。
             // 现在只存文字/图片这些真正每条都不一样的内容，头像统一在渲染时实时从当前资料读取。
             await dbAction("chat", "readwrite", store => {
                 return new Promise(res => {
-                    const req = store.add({ sender, text, avatar: null, isMe, isLetterFormat, letterId, isRead, messageType, sentTime, quotedId, quotedSender, quotedText });
+                    const req = store.add({ sender, text, avatar: null, isMe, isLetterFormat, letterId, isRead, messageType, sentTime, quotedId, quotedSender, quotedText, quotedTime });
                     req.onsuccess = (e) => { insertedId = e.target.result; res(); };
                 });
             });
-            appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat, letterId, isRead, insertedId, messageType, sentTime, quotedSender, quotedText, quotedId);
+            appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat, letterId, isRead, insertedId, messageType, sentTime, quotedSender, quotedText, quotedId, quotedTime);
             
             refreshLastStatusTags();
             const b = document.getElementById('chat-box'); b.scrollTop = b.scrollHeight;
@@ -2541,6 +2548,33 @@
             return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         }
 
+        // 引用块里显示的完整日期时间：2026年11月24日 14:05:33
+        function formatQuoteDateTime(isoStr) {
+            if(!isoStr) return '';
+            const d = new Date(isoStr);
+            if(isNaN(d.getTime())) return '';
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日 ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        }
+
+        // 老的引用记录里没存被引用消息的时间，这里按 id 回查原消息并缓存
+        const quoteTimeCache = new Map();
+        async function fetchQuotedMessageTime(quotedId) {
+            const id = parseInt(quotedId);
+            if (isNaN(id)) return null;
+            if (quoteTimeCache.has(id)) return quoteTimeCache.get(id);
+            let t = null;
+            try {
+                await dbAction("chat", "readonly", store => {
+                    return new Promise(res => {
+                        store.get(id).onsuccess = e => { const r = e.target.result; t = r ? (r.sentTime || null) : null; res(); };
+                    });
+                });
+            } catch (err) {}
+            quoteTimeCache.set(id, t);
+            return t;
+        }
+
         function buildDateSeparatorNode(dateObj) {
             const sep = document.createElement('div');
             sep.className = 'chat-date-separator';
@@ -2548,7 +2582,7 @@
             return sep;
         }
 
-        function buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null) {
+        function buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null, quotedTime = null) {
             const div = document.createElement('div'); 
             div.className = `message ${isMe ? 'me' : 'other'}`;
             if(dbId) div.setAttribute('data-db-id', dbId);
@@ -2569,7 +2603,7 @@
             const displayName = isMe ? AppState.myProfile.name : AppState.otherProfile.name;
             const nicknameHtml = `<div class="msg-sender-name">${escapeHtml(displayName)}</div>`;
 
-            const quoteBlockHtml = quotedText ? `<div class="msg-quote-block" data-quoted-id="${quotedId || ''}">${escapeHtml(quotedSender || '')}: ${escapeHtml(quotedText.length > 24 ? quotedText.substring(0,24) + '…' : quotedText)}</div>` : '';
+            const quoteBlockHtml = quotedText ? `<div class="msg-quote-block" data-quoted-id="${quotedId || ''}"><div class="msg-quote-head"><span class="msg-quote-sender">${escapeHtml(quotedSender || '')}</span></div><div class="msg-quote-text">${escapeHtml(quotedText)}</div><div class="msg-quote-time">${escapeHtml(formatQuoteDateTime(quotedTime))}</div></div>` : '';
 
             let contentBodyHtml = '';
             if (isLetterFormat) {
@@ -2651,11 +2685,17 @@
                     jumpToMessage(quoteBlockNode.dataset.quotedId);
                 });
             }
+            if(quoteBlockNode && !quotedTime && quotedId) {
+                fetchQuotedMessageTime(quotedId).then(t => {
+                    const timeEl = quoteBlockNode.querySelector('.msg-quote-time');
+                    if (timeEl && t) timeEl.textContent = formatQuoteDateTime(t);
+                });
+            }
 
             return div;
         }
 
-        function appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null) {
+        function appendChatMessageDOM(sender, text, avatar, isMe, isLetterFormat = false, letterId = null, isRead = 1, dbId = null, messageType = 'text', sentTime = null, quotedSender = null, quotedText = null, quotedId = null, quotedTime = null) {
             const box = document.getElementById('chat-box');
 
             // 日期分隔线：与上一条渲染的消息不在同一天时，先插入“今天/昨天/x月x日”标签
@@ -2667,12 +2707,21 @@
             }
             if (firstRenderedDateKey === null) firstRenderedDateKey = msgDateKey;
 
-            const div = buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat, letterId, isRead, dbId, messageType, sentTime, quotedSender, quotedText, quotedId);
+            const div = buildChatMessageElement(sender, text, avatar, isMe, isLetterFormat, letterId, isRead, dbId, messageType, sentTime, quotedSender, quotedText, quotedId, quotedTime);
             box.appendChild(div);
         }
 
-        function jumpToMessage(quotedId) {
-            const targetNode = document.querySelector(`.message[data-db-id="${quotedId}"]`);
+        async function jumpToMessage(quotedId) {
+            let targetNode = document.querySelector(`.message[data-db-id="${quotedId}"]`);
+            // 被引用的消息还没加载出来（分页加载）时，一页页往前加载，直到找到它
+            const targetIdNum = parseInt(quotedId);
+            let guard = 0;
+            while (!targetNode && !isNaN(targetIdNum) && ChatPageState.hasMore && !ChatPageState.isLoadingOlder
+                   && ChatPageState.oldestLoadedId !== null && targetIdNum < ChatPageState.oldestLoadedId && guard < 200) {
+                await loadOlderChatMessages();
+                targetNode = document.querySelector(`.message[data-db-id="${quotedId}"]`);
+                guard++;
+            }
             if (!targetNode) return;
             targetNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
             targetNode.classList.add('msg-highlight-flash');
@@ -2779,7 +2828,8 @@
             AppState.quotingMessage = {
                 id: parseInt(dbId),
                 sender: msgData.sender,
-                text: previewText
+                text: previewText,
+                time: msgData.sentTime || null
             };
             renderQuotePreviewBar();
         }
@@ -2787,7 +2837,7 @@
         function renderQuotePreviewBar() {
             const bar = document.getElementById('quote-preview-bar');
             if(!AppState.quotingMessage) { bar.style.display = 'none'; return; }
-            document.getElementById('quote-preview-sender').innerText = AppState.quotingMessage.sender;
+            document.getElementById('quote-preview-sender').innerText = AppState.quotingMessage.sender + (AppState.quotingMessage.time ? ' ' + formatQuoteDateTime(AppState.quotingMessage.time) : '');
             document.getElementById('quote-preview-text').innerText = AppState.quotingMessage.text;
             bar.style.display = 'flex';
         }
@@ -3926,7 +3976,7 @@ nav {
                     if (randomMsg.messageType === 'emoji') previewText = '[表情]';
                     else if (randomMsg.messageType === 'photo') previewText = '[图片]';
                     else previewText = randomMsg.text;
-                    quoteInfo = { id: randomMsg.id, sender: randomMsg.sender, text: previewText };
+                    quoteInfo = { id: randomMsg.id, sender: randomMsg.sender, text: previewText, time: randomMsg.sentTime || null };
                 }
             }
 
